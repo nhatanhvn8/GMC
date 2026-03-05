@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.0.10] - 2026-03-05
+- Script-first flow: ưu tiên rule/script, giảm phụ thuộc AI trong detect login state
+- Tăng nhận diện DOM đa ngôn ngữ và ổn định hơn cho login/recovery challenge
+
 ## [1.0.9] - 2026-03-05
 - Bump version
 
