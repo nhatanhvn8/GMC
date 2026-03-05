@@ -1,5 +1,8 @@
 # Changelog
 
+## [1.0.9] - 2026-03-05
+- Bump version
+
 ## [1.0.8] - 2026-03-05
 - Nhận diện trang hoạt động với mọi ngôn ngữ UI (EN/VI/TH/JA/KO/ZH/FR/DE/ES/...)
 - Thay thế toàn bộ body text detection bằng DOM structure: maxlength, inputmode, autocomplete, URL, form action, data-challengetype
