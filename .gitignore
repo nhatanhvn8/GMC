@@ -1,0 +1,52 @@
+# Browser binaries - quá nặng, copy thủ công sang máy train
+browser/
+
+# Dữ liệu tài khoản - KHÔNG bao giờ push lên GitHub
+data/accounts_db.json
+config/accounts_db.json
+Run/
+Run
+data/list_proxy.txt
+data/list_pass.txt
+data/list_mail_kp.txt
+data/*.txt
+data/*.csv
+
+# Config chứa API key và thông tin nhạy cảm
+data/hconfig.ini
+config/tool_config.json
+
+# AI cache (có thể lớn, tự build lại được)
+config/dom_patterns.json
+config/status_mapping.json
+config/learned_keywords.json
+
+# Log files
+logs/
+*.log
+export/
+
+# Chrome profiles tạm thời
+data/chrome_profiles/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# GoLogin / GPM temp files
+*.tmp
+*.lock
+
+# VS Code / Cursor settings (tuỳ chọn)
+.vscode/
+.cursor/
+
+# Windows
+Thumbs.db
+desktop.ini
