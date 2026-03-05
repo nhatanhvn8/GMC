@@ -10,11 +10,11 @@ git config credential.helper wincred >nul 2>&1
 :: Khoi tao repo neu chua co
 if not exist ".git" (
     git init -b main >nul 2>&1
-    git remote add gmc https://github.com/nhatanhvn8/GMC.git >nul 2>&1
+    git remote add gmc git@github.com:nhatanhvn8/GMC.git >nul 2>&1
 ) else (
     git remote get-url gmc >nul 2>&1
     if %errorlevel% neq 0 (
-        git remote add gmc https://github.com/nhatanhvn8/GMC.git >nul 2>&1
+        git remote add gmc git@github.com:nhatanhvn8/GMC.git >nul 2>&1
     )
 )
 
