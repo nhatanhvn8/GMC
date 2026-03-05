@@ -1072,7 +1072,9 @@ def _handle_recovery_email(driver, recovery_email: str) -> bool:
 
 
 def _classify_verify_challenge_kind(driver) -> tuple[str, int, int]:
-    """Phân loại challenge verify theo điểm: phone / twofa / unknown."""
+    """Phân loại challenge verify theo điểm: phone / twofa / unknown.
+    Hoàn toàn dựa vào URL + DOM structure — không đọc body text nên hoạt động mọi ngôn ngữ.
+    """
     from selenium.webdriver.common.by import By
     phone_score = 0
     twofa_score = 0
@@ -1080,30 +1082,16 @@ def _classify_verify_challenge_kind(driver) -> tuple[str, int, int]:
         url = (driver.current_url or "").lower()
     except Exception:
         url = ""
-    try:
-        body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-    except Exception:
-        body = ""
 
-    # URL signals
-    if any(k in url for k in ("/challenge/totp", "/challenge/az", "/challenge/sk", "/signinoptions")):
-        twofa_score += 5
-    if any(k in url for k in ("/challenge/ipp", "/challenge/iap", "/iap/verify")):
-        phone_score += 4
+    # ── URL signals (trọng số cao nhất) ──
+    if any(k in url for k in ("/challenge/totp", "/challenge/az", "/challenge/sk",
+                               "/challenge/ootp", "/challenge/duo", "/signinoptions")):
+        twofa_score += 6
+    if any(k in url for k in ("/challenge/ipp", "/challenge/iap", "/iap/verify",
+                               "/challenge/sms", "/challenge/phone")):
+        phone_score += 6
 
-    # Body signals
-    if any(k in body for k in (
-        "google authenticator", "authenticator app", "2-step verification",
-        "enter code", "one-time", "verification code",
-    )):
-        twofa_score += 3
-    if any(k in body for k in (
-        "enter a phone number", "phone number", "text message",
-        "sms", "số điện thoại", "nhập số điện thoại",
-    )):
-        phone_score += 3
-
-    # Input signals
+    # ── Input DOM signals ──
     try:
         inputs = driver.find_elements(By.CSS_SELECTOR, "input")
     except Exception:
@@ -1116,21 +1104,55 @@ def _classify_verify_challenge_kind(driver) -> tuple[str, int, int]:
             ac = (el.get_attribute("autocomplete") or "").lower()
             ml = (el.get_attribute("maxlength") or "").strip()
             nm = ((el.get_attribute("name") or "") + " " + (el.get_attribute("id") or "")).lower()
+            im = (el.get_attribute("inputmode") or "").lower()
 
             if ac == "one-time-code":
-                twofa_score += 4
+                twofa_score += 5
             if ml == "6":
-                twofa_score += 3
-            if typ == "tel" and ml not in ("", "6"):
-                phone_score += 3
+                twofa_score += 4
+            if ml == "8" and im == "numeric":
+                twofa_score += 3  # backup code
+            if typ == "tel" and ml not in ("", "6", "8"):
+                phone_score += 4
             if "tel" in ac or "phone" in ac:
+                phone_score += 4
+            if "code" in nm or "totp" in nm or "otp" in nm:
+                twofa_score += 3
+            if "phone" in nm or "mobile" in nm:
                 phone_score += 3
-            if "code" in nm:
-                twofa_score += 2
-            if "phone" in nm:
-                phone_score += 2
+            if im == "numeric" and ml and ml.isdigit() and int(ml) <= 8:
+                twofa_score += 3
+            if typ == "tel" and (not ml or (ml.isdigit() and int(ml) > 10)):
+                phone_score += 3
         except Exception:
             pass
+
+    # ── Page-level structural signals ──
+    try:
+        js_signals = driver.execute_script("""
+            var r = {phone: 0, totp: 0};
+            // Country code selector = phone
+            if (document.querySelector('[data-country-code],[aria-label*="country" i],select[name*="country" i]')) r.phone += 3;
+            // Timer/countdown = TOTP expiry
+            if (document.querySelector('[role="timer"],[data-remaining-time],.countdown')) r.totp += 3;
+            // form action
+            for (var f of document.forms) {
+                var a = (f.action || '').toLowerCase();
+                if (a.includes('ipp') || a.includes('/phone') || a.includes('/sms')) r.phone += 3;
+                if (a.includes('totp') || a.includes('/az/') || a.includes('/otp')) r.totp += 3;
+            }
+            // data-challengetype
+            for (var el of document.querySelectorAll('[data-challengetype]')) {
+                var ct = (el.getAttribute('data-challengetype') || '').toLowerCase();
+                if (ct.includes('totp') || ct === '6' || ct === '33') r.totp += 4;
+                if (ct.includes('phone') || ct.includes('sms') || ct === '9' || ct === '10') r.phone += 4;
+            }
+            return r;
+        """) or {}
+        phone_score += js_signals.get("phone", 0)
+        twofa_score += js_signals.get("totp", 0)
+    except Exception:
+        pass
 
     if twofa_score >= phone_score + 2 and twofa_score >= 3:
         return ("twofa", phone_score, twofa_score)
@@ -1149,29 +1171,34 @@ def _is_phone_number_challenge_page(driver) -> bool:
         if kind == "twofa":
             return False
 
-        # fallback nhẹ nếu classifier chưa chắc chắn
-        body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+        # fallback structural — không đọc body text (ngôn ngữ nào cũng hoạt động)
         inps = driver.find_elements(By.CSS_SELECTOR,
             "input[type='tel'], input[autocomplete*='tel'], input[autocomplete*='phone']")
         for el in inps:
             if not el.is_displayed():
                 continue
             ml = (el.get_attribute("maxlength") or "").strip()
+            # maxlength=6 → likely TOTP, skip
             if ml == "6":
                 continue
             return True
-        if any(k in body for k in [
-            "enter a phone number",
-            "phone number",
-            "text message with a verification code",
-            "get a text message",
-            "số điện thoại",
-            "nhập số điện thoại",
-            "mã xác minh qua sms",
-        ]):
-            return True
-        if inps and any(e.is_displayed() for e in inps):
-            return True
+        # Country code selector = phone number entry
+        try:
+            has_phone_ui = driver.execute_script("""
+                if (document.querySelector('[data-country-code],[aria-label*="country" i],select[name*="country" i]')) return true;
+                var forms = document.querySelectorAll('form');
+                for (var f of forms) {
+                    var a = (f.action || '').toLowerCase();
+                    if (a.includes('ipp') || a.includes('/phone') || a.includes('/sms')) return true;
+                }
+                var telInps = document.querySelectorAll('input[type="tel"]:not([maxlength="6"])');
+                for (var inp of telInps) { if (inp.offsetParent) return true; }
+                return false;
+            """)
+            if has_phone_ui:
+                return True
+        except Exception:
+            pass
         _ = (p_score, t_score)  # giữ biến cho debug khi cần
     except Exception:
         pass
@@ -1782,13 +1809,43 @@ def _is_post_login_setup_page(driver) -> bool:
         return True
     from selenium.webdriver.common.by import By
     try:
-        body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-        if any(kw in body for kw in (
-            "make sure you can always sign in",
-            "add a recovery phone", "add a recovery email",
-            "keep your account secure", "your recovery info",
-        )):
-            return True
+        # Structural: trang post-login setup thường có nút "Skip" hoặc link "Not now"
+        # và không có input email/password thông thường
+        pw_inps = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        if any(e.is_displayed() for e in pw_inps):
+            return False
+        id_inps = driver.find_elements(By.CSS_SELECTOR, "#identifierId, input[name='identifier']")
+        if any(e.is_displayed() for e in id_inps):
+            return False
+        # URL này đã được kiểm tra ở trên; tuy nhiên cũng check data-scrname + page context
+        try:
+            has_setup_structure = driver.execute_script("""
+                // Skip/Not now button = post-login setup screen
+                var btns = document.querySelectorAll('button,[role="button"],a');
+                for (var b of btns) {
+                    var href = (b.href || b.getAttribute('href') || '').toLowerCase();
+                    var js = (b.getAttribute('jsname') || '').toLowerCase();
+                    if (href.includes('skip') || href.includes('notnow') || href.includes('not-now')) return true;
+                    if (js === 'e3opfe' || js === 'nupqlb') return true;  // Google's skip button jsnames
+                }
+                // accounts.google.com URL without challenge/signin path = setup
+                var url = location.href.toLowerCase();
+                if (url.includes('accounts.google.com') &&
+                    !url.includes('/v3/signin') &&
+                    !url.includes('/challenge/') &&
+                    !url.includes('/identifier') &&
+                    !url.includes('/pwd')) {
+                    var inps = document.querySelectorAll('input:not([type="hidden"])');
+                    var visInps = 0;
+                    for (var i of inps) { if (i.offsetParent) visInps++; }
+                    if (visInps === 0) return true;  // no visible inputs = likely setup/info page
+                }
+                return false;
+            """)
+            if has_setup_structure:
+                return True
+        except Exception:
+            pass
     except Exception:
         pass
     return False
@@ -1886,9 +1943,12 @@ def _is_2fa_challenge_page(driver) -> bool:
     if any(h in url for h in _2FA_URL_HINTS):
         return True
     try:
+        # Structural check: 6/8-digit numeric input = 2FA (không cần đọc text)
         inps = driver.find_elements(By.CSS_SELECTOR,
-            "input[autocomplete='one-time-code'], input[type='tel'][maxlength='6'], "
-            "input[maxlength='6'][inputmode='numeric'], input[maxlength='6']")
+            "input[autocomplete='one-time-code'], "
+            "input[maxlength='6']:not([type='hidden']), "
+            "input[maxlength='8'][inputmode='numeric']:not([type='hidden']), "
+            "input[type='tel'][maxlength='6']")
         visible = [e for e in inps if e.is_displayed() and e.is_enabled()]
         if visible:
             pw_inps = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
@@ -1896,37 +1956,84 @@ def _is_2fa_challenge_page(driver) -> bool:
             if visible_pw:
                 return False
             return True
-        body = driver.find_element(By.TAG_NAME, "body").text.lower()
-        body_hints = [
-            "authenticator", "verification code", "one-time", "enter code",
-            "xác minh 2 bước", "2-step verification",
-        ]
-        if any(h in body for h in body_hints):
-            pw_inps = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
-            visible_pw = [e for e in pw_inps if e.is_displayed()]
-            if visible_pw:
-                return False
-            return True
+        # Page-level signals: TOTP countdown/timer, form action chứa 'totp'/'az'
+        try:
+            js_check = driver.execute_script("""
+                if (document.querySelector('[role="timer"],[data-remaining-time]')) return true;
+                var forms = document.querySelectorAll('form');
+                for (var f of forms) {
+                    var a = (f.action || '').toLowerCase();
+                    if (a.includes('totp') || a.includes('/az/') || a.includes('/sk/')) return true;
+                }
+                var inpAll = document.querySelectorAll('input:not([type="hidden"])');
+                for (var inp of inpAll) {
+                    var ml = inp.maxLength;
+                    var im = (inp.inputMode || '').toLowerCase();
+                    if (ml === 6 && ['tel','text','number',''].includes(inp.type.toLowerCase())) return true;
+                    if (ml === 8 && im === 'numeric') return true;
+                }
+                return false;
+            """)
+            if js_check:
+                pw_inps = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+                if not any(e.is_displayed() for e in pw_inps):
+                    return True
+        except Exception:
+            pass
     except Exception:
         pass
     return False
 
 
 def _is_verify_recovery_page(driver) -> bool:
-    """Trang xác minh / thiết lập email khôi phục — đa ngôn ngữ.
-    Trả False nếu trang có input[type='tel'] (đó là phone challenge).
+    """Trang xác minh / thiết lập email khôi phục — hoạt động với mọi ngôn ngữ.
+    Dùng URL và cấu trúc DOM thay vì đọc text.
     """
     from selenium.webdriver.common.by import By
     try:
+        url = (driver.current_url or "").lower()
+        # URL signals — chắc nhất
+        if any(h in url for h in ("recovery/email", "rescueemail", "recovery-email",
+                                   "signinoptions/rescueemail")):
+            return True
+        # Nếu đang ở trang challenges/recovery của accounts.google.com
+        if "accounts.google.com" not in url:
+            return False
+
+        # Tel/phone inputs có nghĩa đây là phone challenge, không phải recovery email
         tel_inputs = driver.find_elements(By.CSS_SELECTOR,
             "input[type='tel'], input[autocomplete*='tel'], input[autocomplete*='phone']")
         if any(el.is_displayed() for el in tel_inputs):
             return False
-        page = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-        if any(k in page for k in ("enter a phone number", "phone number", "text message",
-                                     "get a text message", "số điện thoại")):
-            return False
-        return any(k in page for k in _RECOVERY_PAGE_KEYWORDS)
+
+        # Email input → recovery email step
+        email_inps = driver.find_elements(By.CSS_SELECTOR,
+            "input[type='email'], input[autocomplete='email'], input[autocomplete*='recovery-email']")
+        if any(el.is_displayed() for el in email_inps):
+            return True
+
+        # Form action chứa 'rescue' hoặc 'recovery-email'
+        try:
+            fa = driver.execute_script("""
+                var r = '';
+                for (var f of document.forms) r += ' ' + (f.action || '').toLowerCase();
+                return r;
+            """) or ""
+            if any(h in fa for h in ("rescue", "recovery", "recoveryemail")):
+                return True
+        except Exception:
+            pass
+
+        # Fallback: keyword list đa ngôn ngữ (không đọc toàn bộ body, chỉ innerText ngắn)
+        try:
+            snippet = driver.execute_script(
+                "return (document.body.innerText || '').substring(0, 800).toLowerCase();"
+            ) or ""
+            if any(k in snippet for k in _RECOVERY_PAGE_KEYWORDS):
+                return True
+        except Exception:
+            pass
+        return False
     except Exception:
         return False
 
@@ -2117,24 +2224,27 @@ def _is_recovery_choice_page(driver) -> bool:
         if choices >= 2:
             return True
 
-        # Fallback: tìm bất kỳ clickable element nào chứa text về challenge methods
-        clickable_els = driver.find_elements(By.CSS_SELECTOR,
-            "li, div[role='button'], div[role='link'], button, a")
-        challenge_keywords = 0
-        for el in clickable_els:
-            try:
-                if not el.is_displayed():
-                    continue
-                txt = (el.text or "").lower()
-                if any(kw in txt for kw in (
-                    "verification code", "recovery email", "confirm your",
-                    "try another way", "another way", "authenticator",
-                    "security key", "phone", "text message",
-                )):
-                    challenge_keywords += 1
-            except Exception:
-                continue
-        return challenge_keywords >= 2
+        # Fallback structural: tìm các item có cùng cấu trúc (list-like challenge options)
+        try:
+            structural_count = driver.execute_script("""
+                var count = 0;
+                // Các pattern Google dùng cho challenge choice list
+                var candidates = document.querySelectorAll(
+                    'li[jsname], li[jscontroller], ' +
+                    'div[jsname][role="button"], div[jsname][role="link"], ' +
+                    '[data-challengetype], [data-challengeid], ' +
+                    'div[role="listitem"], [role="menuitem"]'
+                );
+                for (var el of candidates) {
+                    if (el.offsetParent !== null) count++;
+                }
+                return count;
+            """) or 0
+            if structural_count >= 2:
+                return True
+        except Exception:
+            pass
+        return False
 
     except Exception:
         return False
@@ -2402,7 +2512,7 @@ def _detect_login_page_kind_once(driver) -> str:
         if t == "hidden":
             continue
 
-        # name/id xác định dứt khoát
+        # name/id/autocomplete xác định dứt khoát
         if "totppin" in nm_id or "totp" in nm_id or "otp" in nm_id:
             has_definite_2fa = True
             continue
@@ -2413,6 +2523,19 @@ def _detect_login_page_kind_once(driver) -> str:
             has_definite_phone = True
             continue
         if "phone" in nm or "phone" in iid:
+            has_definite_phone = True
+            continue
+
+        # ── Structural: maxlength/inputmode — ngôn ngữ nào cũng dùng được ──
+        # Google TOTP luôn 6 chữ số; backup code 8 chữ số
+        if ml in ("6", "8") and t in ("tel", "text", "number", ""):
+            has_definite_2fa = True
+            continue
+        if im == "numeric" and ml and ml.isdigit() and int(ml) <= 8:
+            has_definite_2fa = True
+            continue
+        # type=tel với maxlength rất dài (hoặc không có) → nhập số điện thoại thật
+        if t == "tel" and (not ml or (ml.isdigit() and int(ml) > 10)):
             has_definite_phone = True
             continue
 
@@ -2463,26 +2586,47 @@ def _detect_login_page_kind_once(driver) -> str:
             if "one-time" in ac or "code" in aria or "pin" in aria:
                 return "twofa_challenge"
 
-    # ── LAYER 5: Body text — fallback cuối, chỉ khi chưa xác định ──
+    # ── LAYER 5: Phân tích cấu trúc DOM — không phụ thuộc ngôn ngữ ──
     if ambiguous_inputs:
-        body = _read_page_body_text(driver, 600)
-        _2FA_TEXT = (
-            "authenticator app", "google authenticator", "2-step verification",
-            "enter the 6-digit code", "code from your authenticator",
-            "verification code from your", "code generated by",
-        )
-        _PHONE_TEXT = (
-            "phone number", "enter your phone", "enter a phone",
-            "add phone number", "verify your phone", "text message",
-            "we'll send", "sms",
-        )
-        t2 = sum(1 for h in _2FA_TEXT if h in body)
-        tp = sum(1 for h in _PHONE_TEXT if h in body)
-        if t2 > tp:
-            return "twofa_challenge"
-        if tp > t2:
-            return "phone_challenge"
-        return "twofa_challenge" if ambiguous_inputs[0].get("maxlength") == "6" else "phone_challenge"
+        for inp in ambiguous_inputs:
+            ml_v = inp["maxlength"]
+            # 6/8 ký số → TOTP
+            if ml_v in ("6", "8"):
+                return "twofa_challenge"
+            # numeric ngắn → TOTP
+            if inp["inputmode"] == "numeric" and ml_v and ml_v.isdigit() and int(ml_v) <= 8:
+                return "twofa_challenge"
+            # tel không có maxlength ngắn → số điện thoại
+            if inp["type"] == "tel" and (not ml_v or (ml_v.isdigit() and int(ml_v) > 10)):
+                return "phone_challenge"
+            # aria-label chứa hint (Google dùng English nội bộ cho aria)
+            aria = inp.get("aria", "")
+            if any(h in aria for h in ("phone", "mobile", "number", "telephone")):
+                return "phone_challenge"
+            if any(h in aria for h in ("code", "pin", "otp", "passcode")):
+                return "twofa_challenge"
+        # Phân tích page-level: country code selector = phone; timer/countdown = TOTP
+        try:
+            js_hint = driver.execute_script("""
+                if (document.querySelector('[data-country-code],[data-country],[aria-label*="country" i],select[name*="country" i]')) return 'phone';
+                if (document.querySelector('[role="timer"],[data-remaining-time],.countdown')) return 'totp';
+                var forms = document.querySelectorAll('form');
+                for (var f of forms) {
+                    var a = (f.action || '').toLowerCase();
+                    if (a.includes('ipp') || a.includes('/phone') || a.includes('/sms')) return 'phone';
+                    if (a.includes('totp') || a.includes('/az/') || a.includes('/otp')) return 'totp';
+                }
+                return '';
+            """) or ""
+            if js_hint == "phone":
+                return "phone_challenge"
+            if js_hint == "totp":
+                return "twofa_challenge"
+        except Exception:
+            pass
+        # Tiebreaker cuối: maxlength="6" → TOTP, không có/dài → phone
+        first = ambiguous_inputs[0]
+        return "twofa_challenge" if first.get("maxlength") == "6" else "phone_challenge"
 
     if has_email_only and not has_password and not has_identifier:
         return "recovery_confirm"
@@ -2526,26 +2670,23 @@ def _detect_login_page_kind(driver) -> str:
 
 
 def _is_email_entry_page(driver) -> bool:
-    """Trang bước nhập email/phone (Sign in / Email or phone) — sau khi back từ couldn't sign in có thể dừng ở đây."""
+    """Trang bước nhập email/phone — nhận diện bằng DOM, không phụ thuộc ngôn ngữ."""
     from selenium.webdriver.common.by import By
     try:
         url = (driver.current_url or "").lower()
         if "accounts.google.com" not in url:
             return False
-        try:
-            inp = driver.find_element(By.ID, "identifierId")
-            if inp.is_displayed():
-                return True
-        except Exception:
-            pass
-        body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
-        if "email or phone" in body or "use your google account" in body:
+        # identifier input (id="identifierId" hoặc name="identifier") = email entry
+        for sel in ("#identifierId", "input[name='identifier']", "input[autocomplete='username']"):
             try:
-                driver.find_element(By.NAME, "Passwd")
-                return False
+                inp = driver.find_element(By.CSS_SELECTOR, sel)
+                if inp.is_displayed():
+                    # Đảm bảo không phải trang password
+                    pw = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+                    if not any(p.is_displayed() for p in pw):
+                        return True
             except Exception:
                 pass
-            return True
     except Exception:
         pass
     return False
@@ -2571,13 +2712,41 @@ def _is_recaptcha_page(driver) -> bool:
 
 def _is_couldnt_sign_in_page(driver) -> bool:
     """Trang Google báo không thể đăng nhập / bị chặn đăng nhập.
-    Ưu tiên nhận diện theo cấu trúc DOM + URL (không phụ thuộc ngôn ngữ)."""
+    Ưu tiên URL + DOM structure, fallback sang keyword list đa ngôn ngữ."""
     from selenium.webdriver.common.by import By
     try:
         if _is_signin_hard_block_page(driver):
             return True
-        body = (driver.find_element(By.TAG_NAME, "body").text or "").lower().replace("\u2019", "'")
-        return any(h in body for h in _COULDNT_SIGN_IN)
+        url = (driver.current_url or "").lower()
+        # URL signals: Google hay dùng các path này khi block
+        if any(h in url for h in ("/couldnotsignin", "/blocked", "/interstitial", "/disabled")):
+            return True
+        # Structural: có error-container nhưng không có input thao tác
+        try:
+            has_error_no_input = driver.execute_script("""
+                var errorEls = document.querySelectorAll(
+                    '[data-error],[aria-live="assertive"],[role="alert"],.error-msg'
+                );
+                var hasError = false;
+                for (var e of errorEls) { if (e.offsetParent && (e.textContent||'').trim().length > 5) { hasError = true; break; } }
+                if (!hasError) return false;
+                var inps = document.querySelectorAll('input:not([type="hidden"])');
+                var visibleInps = 0;
+                for (var i of inps) { if (i.offsetParent) visibleInps++; }
+                return visibleInps === 0;
+            """)
+            if has_error_no_input:
+                return True
+        except Exception:
+            pass
+        # Fallback: keyword list đa ngôn ngữ — đọc snippet ngắn để tiết kiệm bandwidth
+        try:
+            snippet = driver.execute_script(
+                "return (document.body.innerText || '').substring(0, 1000).toLowerCase().replace(/\u2019/g, \"'\");"
+            ) or ""
+            return any(h in snippet for h in _COULDNT_SIGN_IN)
+        except Exception:
+            pass
     except Exception:
         pass
     return False
@@ -3228,12 +3397,33 @@ def change_password_flow(driver, new_password: str, worker_id: str = "main", cur
             return False
 
     def _has_validation_error() -> bool:
+        # DOM-based: kiểm tra aria-invalid hoặc error elements — không phụ thuộc ngôn ngữ
+        try:
+            has_err = driver.execute_script("""
+                // Input với aria-invalid="true" = validation error
+                if (document.querySelector('input[aria-invalid="true"]')) return true;
+                // Error message elements (Google dùng aria-live hoặc role=alert)
+                var errEls = document.querySelectorAll(
+                    '[aria-live="assertive"],[role="alert"],[aria-live="polite"],' +
+                    '.LXRPh,.o6cuMc,.Ekjuhf,[data-error],[aria-describedby]'
+                );
+                for (var e of errEls) {
+                    if (e.offsetParent && (e.textContent || '').trim().length > 2) return true;
+                }
+                return false;
+            """)
+            if has_err:
+                return True
+        except Exception:
+            pass
+        # Fallback multilingual text
         body = _body()
         _ERRORS = (
-            "please choose a longer password", "too short",
-            "use at least 8 characters", "at least 8",
-            "passwords don't match", "password don't match",
+            "too short", "at least 8", "don't match", "do not match",
             "mật khẩu quá ngắn", "mật khẩu không khớp",
+            "sehr kurz", "zu kurz", "stimmen nicht", "trop court",
+            "ne correspondent pas", "demasiado corta", "contraseñas no coinciden",
+            "troppo corta", "não coincidem", "短すぎ", "일치하지", "太短",
         )
         return any(e in body for e in _ERRORS)
 
@@ -4027,11 +4217,20 @@ def _detect_account_state(driver) -> str:
         return "suspended"
     if any(h in body for h in _ACCOUNT_DELETED):
         return "deleted"
-    if "restricted" in body and "account" in body:
+    # Multilingual: restricted/unusual activity/too many attempts
+    _RESTRICTED = ("restricted", "hạn chế", "eingeschränkt", "restreint", "restringida",
+                   "limitada", "ограничена", "제한", "制限", "dibatasi")
+    _SUSPICIOUS = ("unusual activity", "suspicious", "hoạt động bất thường", "actividad inusual",
+                   "activité inhabituelle", "ungewöhnliche aktivität", "nécessite une vérification",
+                   "活動異常", "異常なアクティビティ", "비정상적인 활동")
+    _TOO_MANY = ("too many", "too many attempts", "quá nhiều lần", "demasiados intentos",
+                  "trop de tentatives", "zu viele versuche", "troppi tentativi", "слишком много",
+                  "回数制限", "너무 많은 시도")
+    if any(h in body for h in _RESTRICTED) and "account" in body:
         return "restricted"
-    if "unusual activity" in body or "suspicious" in body:
+    if any(h in body for h in _SUSPICIOUS):
         return "suspicious_activity"
-    if "too many" in body and ("attempt" in body or "request" in body):
+    if any(h in body for h in _TOO_MANY):
         return "too_many_attempts"
     if any(h in body for h in _PASS_CHANGED):
         return "password_changed"
